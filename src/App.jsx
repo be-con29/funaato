@@ -521,7 +521,7 @@ export default function App() {
       return [[[cy - hy, cx - hx], [cy + hy, cx + hx]]];
     };
     const subscribe = (sock) => sock.send(JSON.stringify({
-      APIKey: aisKey,
+      APIKey: String(aisKey).trim(),
       BoundingBoxes: bbox(),
       FilterMessageTypes: ["PositionReport", "ShipStaticData"],
     }));
@@ -531,6 +531,7 @@ export default function App() {
     const connect = () => {
       if (!alive) return;
       ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
+      ws.binaryType = "arraybuffer";
       aisWsRef.current = ws;
 
       ws.onopen = () => {
@@ -539,17 +540,20 @@ export default function App() {
         setAisMsg("");
       };
 
-      ws.onmessage = (ev) => {
+      // 受け取ったテキストを解釈する共通処理
+      const handle = (text) => {
         let m;
-        try { m = JSON.parse(ev.data); } catch {
-          setAisMsg(String(ev.data).slice(0, 160));
+        try { m = JSON.parse(text); } catch {
+          setAisMsg(String(text).slice(0, 160));
           return;
         }
 
-        // AISStream はエラーを平文で返してくる。中身を画面に出す
-        if (m.error || m.Error || m.message || m.Message === undefined && !m.MetaData) {
-          const t = m.error || m.Error || m.message;
-          if (t) { setAisMsg(String(t).slice(0, 160)); setAisState("error"); return; }
+        // サーバーがエラーを返してきたら中身を画面に出す
+        const errText = m.error || m.Error || m.message;
+        if (errText && !m.MetaData) {
+          setAisMsg(String(errText).slice(0, 160));
+          setAisState("error");
+          return;
         }
 
         const meta = m.MetaData || {};
@@ -573,6 +577,19 @@ export default function App() {
         };
         if (ship.lat == null || ship.lng == null) return;
         aisShipsRef.current.set(mmsi, ship);
+      };
+
+      // データは文字列ではなく Blob（バイナリ）で届くことがある。
+      // どの形で来ても文字にしてから解釈する。
+      ws.onmessage = (ev) => {
+        const d = ev.data;
+        if (typeof d === "string") { handle(d); return; }
+        if (d instanceof Blob) { d.text().then(handle).catch(() => {}); return; }
+        if (d instanceof ArrayBuffer) {
+          handle(new TextDecoder().decode(d));
+          return;
+        }
+        handle(String(d));
       };
 
       ws.onerror = () => setAisState("error");
