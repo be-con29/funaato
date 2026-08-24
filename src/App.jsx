@@ -507,6 +507,21 @@ export default function App() {
     aisLayerRef.current = L.layerGroup().addTo(map);
     setAisState("connecting");
 
+    // 購読する範囲。狭すぎると船が入らないので最低でも 0.6度四方は見る
+    const bbox = () => {
+      const b = map.getBounds();
+      const cy = (b.getNorth() + b.getSouth()) / 2;
+      const cx = (b.getEast() + b.getWest()) / 2;
+      const hy = Math.max(0.3, (b.getNorth() - b.getSouth()) / 2 + 0.15);
+      const hx = Math.max(0.3, (b.getEast() - b.getWest()) / 2 + 0.15);
+      return [[[cy - hy, cx - hx], [cy + hy, cx + hx]]];
+    };
+    const subscribe = (sock) => sock.send(JSON.stringify({
+      APIKey: aisKey,
+      BoundingBoxes: bbox(),
+      FilterMessageTypes: ["PositionReport", "ShipStaticData"],
+    }));
+
     let ws, alive = true, timer;
 
     const connect = () => {
@@ -515,16 +530,7 @@ export default function App() {
       aisWsRef.current = ws;
 
       ws.onopen = () => {
-        const b = map.getBounds();
-        ws.send(JSON.stringify({
-          APIKey: aisKey,
-          // 見えている範囲より少し広めを購読する
-          BoundingBoxes: [[
-            [b.getSouth() - 0.2, b.getWest() - 0.2],
-            [b.getNorth() + 0.2, b.getEast() + 0.2],
-          ]],
-          FilterMessageTypes: ["PositionReport", "ShipStaticData"],
-        }));
+        subscribe(ws);
         setAisState("live");
       };
 
@@ -600,19 +606,7 @@ export default function App() {
     }, 2000);
 
     // 地図を大きく動かしたら購読範囲を張り直す
-    const rebind = () => {
-      if (ws?.readyState === 1) {
-        const b = map.getBounds();
-        ws.send(JSON.stringify({
-          APIKey: aisKey,
-          BoundingBoxes: [[
-            [b.getSouth() - 0.2, b.getWest() - 0.2],
-            [b.getNorth() + 0.2, b.getEast() + 0.2],
-          ]],
-          FilterMessageTypes: ["PositionReport", "ShipStaticData"],
-        }));
-      }
-    };
+    const rebind = () => { if (ws?.readyState === 1) subscribe(ws); };
     map.on("moveend", rebind);
 
     return () => {
@@ -900,9 +894,10 @@ ${seg}
         {/* AIS の状態と注意書き */}
         {ais && (
           <div style={{
-            position: "absolute", bottom: 14, left: 12, zIndex: 500,
-            background: "rgba(4,20,29,.86)", border: `1px solid #6B5A8A`,
-            padding: "7px 10px", maxWidth: 210,
+            position: "absolute", top: 12, right: 12, zIndex: 400,
+            marginTop: 190,
+            background: "rgba(4,20,29,.88)", border: `1px solid #6B5A8A`,
+            padding: "7px 10px", maxWidth: 178,
           }}>
             <div style={{ fontSize: 10, color: "#C9A2FF" }}>
               大型船 {aisCount} 隻
@@ -910,6 +905,11 @@ ${seg}
                 {{ connecting: "接続中…", live: "受信中", error: "接続エラー", off: "" }[aisState]}
               </span>
             </div>
+            {aisState === "live" && aisCount === 0 && (
+              <div style={{ fontSize: 9, color: C.warn, marginTop: 4, lineHeight: 1.6 }}>
+                この範囲に船がいません。地図を動かすか、ズームを引いてください。
+              </div>
+            )}
             <div style={{ fontSize: 9, color: C.dim, marginTop: 4, lineHeight: 1.6 }}>
               AIS非搭載の漁船・小型船は表示されません。目視の見張りに代わるものではありません。
             </div>
