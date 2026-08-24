@@ -196,11 +196,23 @@ export default function App() {
     try { localStorage.setItem("funaato:unit", unit); } catch {}
   }, [unit]);
 
+  /* --- AIS（大型船の位置） --- */
+  const [ais, setAis] = useState(false);          // 表示するか
+  const [aisKey, setAisKey] = useState(() => {
+    try { return localStorage.getItem("funaato:aiskey") || ""; } catch { return ""; }
+  });
+  const [aisAsk, setAisAsk] = useState(false);    // キー入力欄を出すか
+  const [aisState, setAisState] = useState("off"); // off/connecting/live/error
+  const [aisCount, setAisCount] = useState(0);
+
   const L = useLeaflet();
   const mapRef = useRef(null);
   const mapElRef = useRef(null);
   const seaRef = useRef(null);
   const radarRef = useRef(null);
+  const aisWsRef = useRef(null);
+  const aisLayerRef = useRef(null);
+  const aisShipsRef = useRef(new Map());
   const wxMarkRef = useRef(null);
   const segRef = useRef([]);
   const boatRef = useRef(null);
@@ -472,6 +484,147 @@ export default function App() {
     return { ...d, min, max, level, next, name: tideName(now) };
   }, [tide]);
 
+  /* ============================================================
+     AIS — 大型船の位置
+     AISStream に直接つないで、地図の見えている範囲の船を受け取る。
+     ※ AIS を積んでいない小型漁船・プレジャーボートは映りません。
+     ============================================================ */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!L || !map) return;
+
+    // 消すとき
+    if (!ais || !aisKey) {
+      aisWsRef.current?.close();
+      aisWsRef.current = null;
+      if (aisLayerRef.current) { map.removeLayer(aisLayerRef.current); aisLayerRef.current = null; }
+      aisShipsRef.current.clear();
+      setAisState("off");
+      setAisCount(0);
+      return;
+    }
+
+    aisLayerRef.current = L.layerGroup().addTo(map);
+    setAisState("connecting");
+
+    let ws, alive = true, timer;
+
+    const connect = () => {
+      if (!alive) return;
+      ws = new WebSocket("wss://stream.aisstream.io/v0/stream");
+      aisWsRef.current = ws;
+
+      ws.onopen = () => {
+        const b = map.getBounds();
+        ws.send(JSON.stringify({
+          APIKey: aisKey,
+          // 見えている範囲より少し広めを購読する
+          BoundingBoxes: [[
+            [b.getSouth() - 0.2, b.getWest() - 0.2],
+            [b.getNorth() + 0.2, b.getEast() + 0.2],
+          ]],
+          FilterMessageTypes: ["PositionReport", "ShipStaticData"],
+        }));
+        setAisState("live");
+      };
+
+      ws.onmessage = (ev) => {
+        let m;
+        try { m = JSON.parse(ev.data); } catch { return; }
+        const meta = m.MetaData || {};
+        const mmsi = meta.MMSI;
+        if (!mmsi) return;
+
+        const prev = aisShipsRef.current.get(mmsi) || {};
+        const pr = m.Message?.PositionReport;
+        const sd = m.Message?.ShipStaticData;
+
+        const ship = {
+          ...prev,
+          mmsi,
+          name: (sd?.Name || meta.ShipName || prev.name || "").trim(),
+          lat: pr?.Latitude ?? meta.latitude ?? prev.lat,
+          lng: pr?.Longitude ?? meta.longitude ?? prev.lng,
+          cog: pr?.Cog ?? prev.cog ?? 0,
+          sog: pr?.Sog ?? prev.sog ?? 0,
+          at: Date.now(),
+        };
+        if (ship.lat == null || ship.lng == null) return;
+        aisShipsRef.current.set(mmsi, ship);
+      };
+
+      ws.onerror = () => setAisState("error");
+      ws.onclose = () => {
+        if (!alive) return;
+        setAisState("connecting");
+        timer = setTimeout(connect, 4000); // 切れたら繋ぎ直す
+      };
+    };
+    connect();
+
+    // 受け取ったそばから描くと重いので、2秒ごとにまとめて描く
+    const draw = setInterval(() => {
+      const layer = aisLayerRef.current;
+      if (!layer) return;
+      layer.clearLayers();
+      const now = Date.now();
+      let n = 0;
+
+      for (const [mmsi, s] of aisShipsRef.current) {
+        // 15分以上更新がない船は消す
+        if (now - s.at > 900000) { aisShipsRef.current.delete(mmsi); continue; }
+        n++;
+        const moving = (s.sog || 0) > 0.5;
+        const icon = L.divIcon({
+          className: "",
+          html: moving
+            ? `<div style="width:0;height:0;border-left:6px solid transparent;
+                 border-right:6px solid transparent;border-bottom:15px solid #C9A2FF;
+                 transform:rotate(${s.cog || 0}deg);transform-origin:50% 66%;
+                 filter:drop-shadow(0 0 3px rgba(201,162,255,.8))"></div>`
+            : `<div style="width:9px;height:9px;border-radius:50%;background:#8E79B5;
+                 border:1px solid #C9A2FF"></div>`,
+          iconSize: [13, 15], iconAnchor: [6, 10],
+        });
+        L.marker([s.lat, s.lng], { icon, zIndexOffset: 400 })
+          .bindPopup(
+            `<div style="font-family:monospace;font-size:12px;line-height:1.7">
+              <b>${s.name || "(船名不明)"}</b><br/>
+              MMSI ${s.mmsi}<br/>
+              ${(s.sog || 0).toFixed(1)} kn · ${Math.round(s.cog || 0)}°
+             </div>`
+          )
+          .addTo(layer);
+      }
+      setAisCount(n);
+    }, 2000);
+
+    // 地図を大きく動かしたら購読範囲を張り直す
+    const rebind = () => {
+      if (ws?.readyState === 1) {
+        const b = map.getBounds();
+        ws.send(JSON.stringify({
+          APIKey: aisKey,
+          BoundingBoxes: [[
+            [b.getSouth() - 0.2, b.getWest() - 0.2],
+            [b.getNorth() + 0.2, b.getEast() + 0.2],
+          ]],
+          FilterMessageTypes: ["PositionReport", "ShipStaticData"],
+        }));
+      }
+    };
+    map.on("moveend", rebind);
+
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      clearInterval(draw);
+      map.off("moveend", rebind);
+      ws?.close();
+      if (aisLayerRef.current) { map.removeLayer(aisLayerRef.current); aisLayerRef.current = null; }
+    };
+  }, [L, ais, aisKey]);
+
   /* ---------- 取得地点を地図の中心へ移す ---------- */
   const wxToCenter = useCallback(() => {
     const c = mapRef.current?.getCenter();
@@ -729,9 +882,86 @@ ${seg}
               {unit === "kn" ? "船 kn" : "車 km/h"}
             </button>
             <button onClick={() => setShowWx((v) => !v)} style={chip(showWx)}>海況</button>
+            <button
+              onClick={() => {
+                if (!aisKey) { setAisAsk(true); return; }
+                setAis((v) => !v);
+              }}
+              style={chip(ais)}
+            >
+              大型船{ais && aisCount > 0 ? ` ${aisCount}` : ""}
+            </button>
             <button onClick={() => setRadar((v) => !v)} style={chip(radar)}>雨雲</button>
             <button onClick={() => setSeamark((v) => !v)} style={chip(seamark)}>航路標識</button>
             <button onClick={() => setFollow((v) => !v)} style={chip(follow)}>自船追従</button>
+          </div>
+        )}
+
+        {/* AIS の状態と注意書き */}
+        {ais && (
+          <div style={{
+            position: "absolute", bottom: 14, left: 12, zIndex: 500,
+            background: "rgba(4,20,29,.86)", border: `1px solid #6B5A8A`,
+            padding: "7px 10px", maxWidth: 210,
+          }}>
+            <div style={{ fontSize: 10, color: "#C9A2FF" }}>
+              大型船 {aisCount} 隻
+              <span style={{ color: C.dim, marginLeft: 6 }}>
+                {{ connecting: "接続中…", live: "受信中", error: "接続エラー", off: "" }[aisState]}
+              </span>
+            </div>
+            <div style={{ fontSize: 9, color: C.dim, marginTop: 4, lineHeight: 1.6 }}>
+              AIS非搭載の漁船・小型船は表示されません。目視の見張りに代わるものではありません。
+            </div>
+          </div>
+        )}
+
+        {/* AIS キーの入力 */}
+        {aisAsk && (
+          <div style={{
+            position: "absolute", inset: 0, zIndex: 900,
+            background: "rgba(4,20,29,.94)", padding: 22,
+            display: "flex", flexDirection: "column", justifyContent: "center",
+          }}>
+            <div style={{ ...label, color: C.head, marginBottom: 10 }}>AIS の APIキー</div>
+            <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.9, marginBottom: 14 }}>
+              aisstream.io で取得したキーを貼り付けてください。
+              キーはこの端末にだけ保存され、外部には送られません。
+            </div>
+            <input
+              type="text"
+              defaultValue={aisKey}
+              id="aiskey-input"
+              placeholder="APIキーを貼り付け"
+              autoComplete="off"
+              spellCheck={false}
+              style={{
+                width: "100%", padding: "12px", background: C.deep,
+                border: `1px solid ${C.rule}`, color: C.head,
+                font: `12px ${mono}`, marginBottom: 14,
+              }}
+            />
+            <div style={{ display: "flex", gap: 9 }}>
+              <button
+                onClick={() => {
+                  const v = document.getElementById("aiskey-input").value.trim();
+                  if (!v) return;
+                  try { localStorage.setItem("funaato:aiskey", v); } catch {}
+                  setAisKey(v); setAisAsk(false); setAis(true);
+                }}
+                style={{ ...btn, borderColor: C.ok, color: C.ok }}
+              >保存して表示</button>
+              <button onClick={() => setAisAsk(false)} style={btn}>やめる</button>
+            </div>
+            {aisKey && (
+              <button
+                onClick={() => {
+                  try { localStorage.removeItem("funaato:aiskey"); } catch {}
+                  setAisKey(""); setAis(false); setAisAsk(false);
+                }}
+                style={{ ...btn, marginTop: 12, borderColor: C.red, color: C.red }}
+              >キーを削除</button>
+            )}
           </div>
         )}
 
