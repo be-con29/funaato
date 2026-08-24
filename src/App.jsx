@@ -204,6 +204,8 @@ export default function App() {
   const [aisAsk, setAisAsk] = useState(false);    // キー入力欄を出すか
   const [aisState, setAisState] = useState("off"); // off/connecting/live/error
   const [aisCount, setAisCount] = useState(0);
+  const [aisMsg, setAisMsg] = useState("");        // サーバーからの返答
+  const [aisRx, setAisRx] = useState(0);           // 受け取った電文の総数
 
   const L = useLeaflet();
   const mapRef = useRef(null);
@@ -501,6 +503,8 @@ export default function App() {
       aisShipsRef.current.clear();
       setAisState("off");
       setAisCount(0);
+      setAisRx(0);
+      setAisMsg("");
       return;
     }
 
@@ -532,14 +536,26 @@ export default function App() {
       ws.onopen = () => {
         subscribe(ws);
         setAisState("live");
+        setAisMsg("");
       };
 
       ws.onmessage = (ev) => {
         let m;
-        try { m = JSON.parse(ev.data); } catch { return; }
+        try { m = JSON.parse(ev.data); } catch {
+          setAisMsg(String(ev.data).slice(0, 160));
+          return;
+        }
+
+        // AISStream はエラーを平文で返してくる。中身を画面に出す
+        if (m.error || m.Error || m.message || m.Message === undefined && !m.MetaData) {
+          const t = m.error || m.Error || m.message;
+          if (t) { setAisMsg(String(t).slice(0, 160)); setAisState("error"); return; }
+        }
+
         const meta = m.MetaData || {};
         const mmsi = meta.MMSI;
         if (!mmsi) return;
+        setAisRx((n) => n + 1);
 
         const prev = aisShipsRef.current.get(mmsi) || {};
         const pr = m.Message?.PositionReport;
@@ -560,8 +576,10 @@ export default function App() {
       };
 
       ws.onerror = () => setAisState("error");
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         if (!alive) return;
+        if (e.reason) setAisMsg(`切断: ${String(e.reason).slice(0, 140)}`);
+        else if (e.code !== 1000 && e.code !== 1005) setAisMsg(`切断コード ${e.code}`);
         setAisState("connecting");
         timer = setTimeout(connect, 4000); // 切れたら繋ぎ直す
       };
@@ -902,12 +920,23 @@ ${seg}
             <div style={{ fontSize: 10, color: "#C9A2FF" }}>
               大型船 {aisCount} 隻
               <span style={{ color: C.dim, marginLeft: 6 }}>
-                {{ connecting: "接続中…", live: "受信中", error: "接続エラー", off: "" }[aisState]}
+                {{ connecting: "接続中…", live: "受信中", error: "エラー", off: "" }[aisState]}
               </span>
             </div>
-            {aisState === "live" && aisCount === 0 && (
-              <div style={{ fontSize: 9, color: C.warn, marginTop: 4, lineHeight: 1.6 }}>
-                この範囲に船がいません。地図を動かすか、ズームを引いてください。
+            <div style={{ fontSize: 9, color: C.dim, marginTop: 3 }}>
+              受信した電文 {aisRx} 件
+            </div>
+            {aisMsg && (
+              <div style={{
+                fontSize: 9, color: C.red, marginTop: 5, lineHeight: 1.6,
+                wordBreak: "break-all",
+              }}>
+                {aisMsg}
+              </div>
+            )}
+            {aisState === "live" && aisRx === 0 && !aisMsg && (
+              <div style={{ fontSize: 9, color: C.warn, marginTop: 5, lineHeight: 1.6 }}>
+                接続はできていますが、データが届いていません。
               </div>
             )}
             <div style={{ fontSize: 9, color: C.dim, marginTop: 4, lineHeight: 1.6 }}>
