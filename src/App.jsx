@@ -152,6 +152,125 @@ function simplify(pts, tol) {
   return pts.filter((_, i) => keep[i]);
 }
 
+/* ============================================================
+   航海の保存（この端末の中に残す）
+   ------------------------------------------------------------
+   点をそのまま入れると場所を食うので、
+   ・5m の許容誤差で間引く
+   ・緯度経度は小数6桁（約10cm）に丸める
+   ・{lat,lng,t,kn} ではなく [lat,lng,経過秒,速度] の並びで持つ
+   これで 3時間の航海がおよそ 80KB に収まります。
+   ============================================================ */
+const TRIPS_KEY = "funaato:trips";
+const tripKey = (id) => `funaato:trip:${id}`;
+
+function loadTripIndex() {
+  try { return JSON.parse(localStorage.getItem(TRIPS_KEY) || "[]"); }
+  catch { return []; }
+}
+
+function saveTrip(pts, ref) {
+  if (!pts || pts.length < 2) return null;
+
+  const xy = pts.map((p) => ({ ...p, ...meters(p, ref) }));
+  const thin = simplify(xy, 5);
+
+  let dist = 0, max = 0;
+  for (let i = 1; i < xy.length; i++) {
+    dist += Math.hypot(xy[i].x - xy[i - 1].x, xy[i].y - xy[i - 1].y);
+    if (xy[i].kn > max) max = xy[i].kn;
+  }
+
+  const t0 = pts[0].t;
+  const body = thin.map((p) => [
+    +p.lat.toFixed(6), +p.lng.toFixed(6),
+    Math.round((p.t - t0) / 1000), +(p.kn || 0).toFixed(1),
+  ]);
+
+  const d = new Date(t0);
+  const id = String(t0);
+  const meta = {
+    id,
+    name: `${d.getMonth() + 1}月${d.getDate()}日 ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`,
+    start: t0,
+    end: pts[pts.length - 1].t,
+    dist: Math.round(dist),
+    max: +max.toFixed(1),
+    n: body.length,
+  };
+
+  try {
+    localStorage.setItem(tripKey(id), JSON.stringify({ t0, p: body }));
+    const idx = loadTripIndex().filter((t) => t.id !== id);
+    idx.unshift(meta);
+    localStorage.setItem(TRIPS_KEY, JSON.stringify(idx));
+    return meta;
+  } catch {
+    return { error: "端末の空き容量が足りません。古い航海を削除してください。" };
+  }
+}
+
+function readTrip(id) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(tripKey(id)));
+    if (!raw) return null;
+    return raw.p.map(([lat, lng, s, kn]) => ({
+      lat, lng, t: raw.t0 + s * 1000, kn, hdg: 0,
+    }));
+  } catch { return null; }
+}
+
+function deleteTrip(id) {
+  try {
+    localStorage.removeItem(tripKey(id));
+    localStorage.setItem(TRIPS_KEY,
+      JSON.stringify(loadTripIndex().filter((t) => t.id !== id)));
+  } catch {}
+}
+
+function renameTrip(id, name) {
+  try {
+    const idx = loadTripIndex().map((t) => (t.id === id ? { ...t, name } : t));
+    localStorage.setItem(TRIPS_KEY, JSON.stringify(idx));
+  } catch {}
+}
+
+/* --- GPX / JSON で書き出す --- */
+function saveFile(pts, kind, title) {
+  if (!pts || pts.length < 2) return;
+  const label = title || `航跡 ${new Date(pts[0].t).toLocaleString("ja-JP")}`;
+  let body, name, type;
+
+  if (kind === "gpx") {
+    const seg = pts.map((p) =>
+      `<trkpt lat="${p.lat.toFixed(7)}" lon="${p.lng.toFixed(7)}"><time>${new Date(p.t).toISOString()}</time></trkpt>`
+    ).join("\n");
+    body = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="funaato" xmlns="http://www.topografix.com/GPX/1/1">
+<trk><name>${label}</name><trkseg>
+${seg}
+</trkseg></trk></gpx>`;
+    name = `${label.replace(/[\\/:*?"<>|]/g, "_")}.gpx`;
+    type = "application/gpx+xml";
+  } else {
+    body = JSON.stringify(pts, null, 1);
+    name = `${label.replace(/[\\/:*?"<>|]/g, "_")}.json`;
+    type = "application/json";
+  }
+
+  const blob = new Blob([body], { type });
+  const file = new File([blob], name, { type });
+  if (navigator.canShare?.({ files: [file] })) {
+    navigator.share({ files: [file] }).catch(() => {});
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
 function useLeaflet() {
   const [L, setL] = useState(null);
   useEffect(() => {
@@ -206,6 +325,23 @@ export default function App() {
   const [aisCount, setAisCount] = useState(0);
   const [aisMsg, setAisMsg] = useState("");        // サーバーからの返答
   const [aisRx, setAisRx] = useState(0);           // 受け取った電文の総数
+
+  /* --- 保存した航海 --- */
+  const [trips, setTrips] = useState(() => loadTripIndex());
+  const [showTrips, setShowTrips] = useState(false);
+  const [viewing, setViewing] = useState(null);    // 表示中の過去の航海
+  const [toast, setToast] = useState("");
+
+  // 端末にデータを消させないようお願いする
+  useEffect(() => {
+    navigator.storage?.persist?.().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 3200);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   const L = useLeaflet();
   const mapRef = useRef(null);
@@ -654,6 +790,43 @@ export default function App() {
     };
   }, [L, ais, aisKey]);
 
+  /* ---------- 保存した航海を地図に呼び出す ---------- */
+  const openTrip = useCallback((meta) => {
+    const p = readTrip(meta.id);
+    if (!p) { setToast("この航海のデータが見つかりません"); return; }
+
+    // 進行方向を点の並びから計算し直す
+    for (let i = 1; i < p.length; i++) {
+      const m = meters(p[i], p[i - 1]);
+      p[i].hdg = (Math.atan2(m.x, m.y) * 180) / Math.PI;
+      if (p[i].hdg < 0) p[i].hdg += 360;
+    }
+
+    segRef.current.forEach((s) => s.remove());
+    segRef.current = [];
+    if (boatRef.current) { boatRef.current.remove(); boatRef.current = null; }
+
+    setFollow(false);
+    setViewing(meta);
+    setPts(p);
+    setShowTrips(false);
+
+    // 航跡全体が入るように地図を合わせる
+    const map = mapRef.current;
+    if (map && L) {
+      const b = L.latLngBounds(p.map((q) => [q.lat, q.lng]));
+      setTimeout(() => map.fitBounds(b, { padding: [40, 40] }), 60);
+    }
+  }, [L]);
+
+  const closeTrip = useCallback(() => {
+    segRef.current.forEach((s) => s.remove());
+    segRef.current = [];
+    if (boatRef.current) { boatRef.current.remove(); boatRef.current = null; }
+    setViewing(null);
+    setPts([]);
+  }, []);
+
   /* ---------- 取得地点を地図の中心へ移す ---------- */
   const wxToCenter = useCallback(() => {
     const c = mapRef.current?.getCenter();
@@ -702,8 +875,10 @@ export default function App() {
   const start = useCallback(async () => {
     if (!navigator.geolocation) { setErr("位置情報を取得できません。"); return; }
     setErr(null);
+    setViewing(null);
     segRef.current.forEach((s) => s.remove());
     segRef.current = [];
+    if (boatRef.current) { boatRef.current.remove(); boatRef.current = null; }
     setPts([]); lastRef.current = null; setFollow(true);
     try { wakeRef.current = await navigator.wakeLock?.request("screen"); } catch {}
 
@@ -747,6 +922,19 @@ export default function App() {
     watchRef.current = null;
     wakeRef.current?.release?.(); wakeRef.current = null;
     setRec(false);
+
+    // 記録を止めたら、そのまま端末に残す
+    setPts((cur) => {
+      if (cur.length >= 2) {
+        const r = saveTrip(cur, cur[0]);
+        if (r?.error) setToast(r.error);
+        else if (r) {
+          setTrips(loadTripIndex());
+          setToast(`「${r.name}」を保存しました`);
+        }
+      }
+      return cur;
+    });
   }, []);
 
   useEffect(() => () => stop(), [stop]);
@@ -812,31 +1000,7 @@ export default function App() {
   }, [online, view, unit]);
 
   /* ---------- 書き出し ---------- */
-  const save = (kind) => {
-    let body, name, type;
-    if (kind === "gpx") {
-      const seg = pts.map((p) =>
-        `<trkpt lat="${p.lat.toFixed(7)}" lon="${p.lng.toFixed(7)}"><time>${new Date(p.t).toISOString()}</time></trkpt>`
-      ).join("\n");
-      body = `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="funaato" xmlns="http://www.topografix.com/GPX/1/1">
-<trk><name>航跡 ${new Date(pts[0].t).toLocaleString("ja-JP")}</name><trkseg>
-${seg}
-</trkseg></trk></gpx>`;
-      name = "track.gpx"; type = "application/gpx+xml";
-    } else {
-      body = JSON.stringify(pts, null, 1);
-      name = "track.json"; type = "application/json";
-    }
-    const blob = new Blob([body], { type });
-    const file = new File([blob], name, { type });
-    if (navigator.canShare?.({ files: [file] })) {
-      navigator.share({ files: [file] }).catch(() => {}); return;
-    }
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = name; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  };
+  const save = (kind) => saveFile(pts, kind);
 
   const last = pts[pts.length - 1];
   const label = { font: `500 10px ${mono}`, letterSpacing: ".14em", color: C.dim };
@@ -906,6 +1070,9 @@ ${seg}
             position: "absolute", top: 12, right: 12, zIndex: 500,
             display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end",
           }}>
+            <button onClick={() => setShowTrips(true)} style={chip(showTrips)}>
+              航海{trips.length ? ` ${trips.length}` : ""}
+            </button>
             <button onClick={() => setUnit((u) => (u === "kn" ? "kmh" : "kn"))}
                     style={chip(false)}>
               {unit === "kn" ? "船 kn" : "車 km/h"}
@@ -1008,6 +1175,112 @@ ${seg}
                 style={{ ...btn, marginTop: 12, borderColor: C.red, color: C.red }}
               >キーを削除</button>
             )}
+          </div>
+        )}
+
+        {/* 保存の通知 */}
+        {toast && (
+          <div style={{
+            position: "absolute", left: 12, right: 12, bottom: 14, zIndex: 800,
+            background: "rgba(6,25,36,.96)", border: `1px solid ${C.ok}`,
+            padding: "11px 14px", fontSize: 12, color: C.ok, lineHeight: 1.6,
+          }}>{toast}</div>
+        )}
+
+        {/* 閲覧中の航海の帯 */}
+        {viewing && !rec && (
+          <div style={{
+            position: "absolute", left: 12, bottom: 14, zIndex: 500,
+            background: "rgba(6,25,36,.94)", border: `1px solid ${C.rule}`,
+            padding: "8px 11px", display: "flex", alignItems: "center", gap: 11,
+          }}>
+            <span style={{ fontSize: 12, color: C.head }}>{viewing.name}</span>
+            <button onClick={closeTrip} style={chip(false)}>閉じる</button>
+          </div>
+        )}
+
+        {/* 航海の一覧 */}
+        {showTrips && (
+          <div style={{
+            position: "absolute", inset: 0, zIndex: 900,
+            background: "rgba(4,20,29,.97)", display: "flex", flexDirection: "column",
+          }}>
+            <div style={{
+              display: "flex", alignItems: "center", padding: "14px 16px",
+              borderBottom: `1px solid ${C.rule}`,
+            }}>
+              <span style={{ ...label, color: C.head }}>保存した航海</span>
+              <span style={{ marginLeft: "auto" }}>
+                <button onClick={() => setShowTrips(false)} style={chip(false)}>閉じる</button>
+              </span>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", padding: "8px 0" }}>
+              {trips.length === 0 && (
+                <div style={{
+                  padding: "40px 24px", fontSize: 12, color: C.dim,
+                  lineHeight: 2, textAlign: "center",
+                }}>
+                  まだ航海がありません。<br />
+                  記録を開始して、止めると自動で保存されます。
+                </div>
+              )}
+
+              {trips.map((t) => (
+                <div key={t.id} style={{
+                  padding: "13px 16px", borderBottom: `1px solid ${C.rule}`,
+                }}>
+                  <div
+                    onClick={() => openTrip(t)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <div style={{ fontSize: 14, color: C.head }}>{t.name}</div>
+                    <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>
+                      {(t.dist / 1000).toFixed(2)} km ·
+                      最高 {conv(t.max, unit).toFixed(1)} {unitLabel(unit)} ·
+                      {Math.round((t.end - t.start) / 60000)} 分
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 7, marginTop: 9, flexWrap: "wrap" }}>
+                    <button onClick={() => openTrip(t)} style={chip(false)}>地図で見る</button>
+                    <button
+                      onClick={() => {
+                        const n = prompt("航海の名前", t.name);
+                        if (n && n.trim()) {
+                          renameTrip(t.id, n.trim());
+                          setTrips(loadTripIndex());
+                        }
+                      }}
+                      style={chip(false)}
+                    >名前</button>
+                    <button
+                      onClick={() => {
+                        const p = readTrip(t.id);
+                        if (p) saveFile(p, "gpx", t.name);
+                      }}
+                      style={chip(false)}
+                    >GPX</button>
+                    <button
+                      onClick={() => {
+                        if (!confirm(`「${t.name}」を削除します。元に戻せません。`)) return;
+                        deleteTrip(t.id);
+                        setTrips(loadTripIndex());
+                        if (viewing?.id === t.id) closeTrip();
+                      }}
+                      style={{ ...chip(false), borderColor: C.red, color: C.red }}
+                    >削除</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{
+              padding: "12px 16px", borderTop: `1px solid ${C.rule}`,
+              fontSize: 9, color: C.dim, lineHeight: 1.8,
+            }}>
+              航海はこの端末の中に保存されます。機種変更やSafariの履歴削除で消えるため、
+              大切な航跡は GPX で書き出して保管してください。
+            </div>
           </div>
         )}
 
